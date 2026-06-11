@@ -1,0 +1,9 @@
+# dependencies
+node_modules/
+
+# Playwright test profiles (Chromium user-data dirs) and artifacts
+test/e2e/.profile*
+
+# OS / editor noise
+.DS_Store
+*.log

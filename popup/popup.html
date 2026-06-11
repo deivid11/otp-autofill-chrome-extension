@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="popup.css" />
+    <title>OTP Autofill</title>
+  </head>
+  <body>
+    <header>
+      <div class="brand">
+        <span class="logo">🔐</span>
+        <span>OTP Autofill</span>
+      </div>
+      <div class="header-actions">
+        <button id="fillBtn" class="ghost" title="Fill the OTP on the current tab">⤵ Fill tab</button>
+        <button id="settingsBtn" class="ghost" title="Settings">⚙</button>
+      </div>
+    </header>
+
+    <main>
+      <section id="accountsView">
+        <div class="searchbar">
+          <input id="searchInput" type="search" placeholder="Search accounts…" autocomplete="off" />
+        </div>
+        <div id="accountList"></div>
+        <div id="emptyState" class="empty hidden">
+          <p>No accounts yet.</p>
+          <p class="muted">Use <b>Add</b> or <b>Scan QR</b> in the footer below, or <b>Import</b> your otpauth:// configs.</p>
+        </div>
+      </section>
+
+      <!-- Add / edit account -->
+      <section id="addView" class="hidden">
+        <h2 id="addTitle">Add account</h2>
+        <div class="row" style="margin-top:0">
+          <label class="filebtn ghost">📷 Fill form from QR image…<input id="addQrFile" type="file" accept="image/*" hidden /></label>
+        </div>
+        <label class="fld">
+          <span>Or paste an otpauth:// URI (fills the fields below)</span>
+          <input id="otpauthInput" type="text" placeholder="otpauth://totp/Issuer:user@mail.com?secret=..." />
+        </label>
+        <div class="grid2">
+          <label class="fld"><span>Issuer</span><input id="f_issuer" type="text" placeholder="OpmSpei" /></label>
+          <label class="fld"><span>Account / email</span><input id="f_account" type="text" placeholder="user@mail.com" /></label>
+        </div>
+        <label class="fld"><span>Secret (base32)</span><input id="f_secret" type="text" placeholder="JBSWY3DPEHPK3PXP" /></label>
+        <div class="grid3">
+          <label class="fld"><span>Algorithm</span>
+            <select id="f_algorithm">
+              <option>SHA1</option><option>SHA256</option><option>SHA512</option>
+            </select>
+          </label>
+          <label class="fld"><span>Digits</span><input id="f_digits" type="number" value="6" min="4" max="10" /></label>
+          <label class="fld"><span>Period</span><input id="f_period" type="number" value="30" min="10" max="120" /></label>
+        </div>
+        <div class="row">
+          <button id="saveBtn" class="primary">Save</button>
+          <button id="cancelAddBtn" class="ghost">Cancel</button>
+        </div>
+      </section>
+
+      <!-- Import -->
+      <section id="importView" class="hidden">
+        <h2>Import accounts</h2>
+        <p class="muted">Scan a QR code, or paste <code>otpauth://</code> URIs (one per line) / a JSON export.</p>
+        <div class="row">
+          <label class="filebtn ghost">📷 Scan QR image…<input id="qrFile" type="file" accept="image/*" hidden /></label>
+          <button id="qrPageBtn" class="ghost">🖼 Scan QR on page</button>
+        </div>
+        <p id="qrResult" class="muted"></p>
+        <textarea id="importText" rows="7" placeholder="otpauth://totp/SCORE_UAT:?secret=KRSXG5CTMVRXEZLU&issuer=SCORE_UAT
+otpauth://totp/OpmSpei:user%40mail.com?secret=...&issuer=OpmSpei"></textarea>
+        <div class="row">
+          <label class="filebtn ghost">Choose file…<input id="importFile" type="file" accept=".json,.txt" hidden /></label>
+          <button id="doImportBtn" class="primary">Import</button>
+          <button id="cancelImportBtn" class="ghost">Cancel</button>
+        </div>
+        <p id="importResult" class="muted"></p>
+      </section>
+
+      <!-- Export -->
+      <section id="exportView" class="hidden">
+        <h2>Export accounts</h2>
+        <textarea id="exportText" rows="8" readonly></textarea>
+        <div class="row">
+          <button id="copyExportBtn" class="primary">Copy</button>
+          <button id="downloadJsonBtn" class="ghost">Download JSON</button>
+          <button id="downloadUriBtn" class="ghost">Download .txt (URIs)</button>
+          <button id="cancelExportBtn" class="ghost">Close</button>
+        </div>
+      </section>
+
+      <!-- Settings -->
+      <section id="settingsView" class="hidden">
+        <h2>Settings</h2>
+        <label class="chk"><input type="checkbox" id="s_autoFill" /> Autofill OTP automatically</label>
+        <label class="chk"><input type="checkbox" id="s_autoSubmit" /> Auto-submit after filling</label>
+        <label class="chk"><input type="checkbox" id="s_fallbackSingle" /> Use the only account when no email match</label>
+        <label class="chk"><input type="checkbox" id="s_matchByIssuer" /> Match page by issuer name</label>
+        <label class="chk"><input type="checkbox" id="s_rememberDomainEmail" /> Remember last login email per domain</label>
+        <label class="chk"><input type="checkbox" id="s_showButton" /> Show floating "Fill OTP" button</label>
+        <label class="chk"><input type="checkbox" id="s_debug" /> Debug logging (DevTools console)</label>
+
+        <h2 style="margin-top:18px;">Remembered logins</h2>
+        <p class="muted">Used to match OTP screens that have no email field (e.g. transaction confirmations).</p>
+        <div id="rememberedList"></div>
+        <div class="row">
+          <button id="clearRememberedBtn" class="ghost">Clear all remembered</button>
+        </div>
+
+        <h2 style="margin-top:18px;">Data</h2>
+        <div class="row">
+          <button id="exportFromSettingsBtn" class="ghost">⤓ Export accounts…</button>
+        </div>
+
+        <div class="row">
+          <button id="closeSettingsBtn" class="primary">Done</button>
+        </div>
+      </section>
+    </main>
+
+    <!-- Always-visible quick-action footer -->
+    <footer class="footbar">
+      <button id="navAccounts" class="footbtn" title="Accounts"><span class="ic">🏠</span><span>Accounts</span></button>
+      <button id="navAdd" class="footbtn" title="Add account"><span class="ic">＋</span><span>Add</span></button>
+      <button id="navScan" class="footbtn accent" title="Detect a QR on this page, or pick an image"><span class="ic">📷</span><span>Scan QR</span></button>
+      <button id="navImport" class="footbtn" title="Import / Export"><span class="ic">⇅</span><span>Import</span></button>
+      <button id="navSettings" class="footbtn" title="Settings"><span class="ic">⚙</span><span>Settings</span></button>
+    </footer>
+
+    <!-- Global QR file input, reachable from anywhere via the footer -->
+    <input id="qrFileGlobal" type="file" accept="image/*" hidden />
+
+    <div id="toast" class="toast hidden"></div>
+
+    <script src="../src/totp.js"></script>
+    <script src="../src/otpauth.js"></script>
+    <script src="../src/storage.js"></script>
+    <script src="../vendor/jsQR.js"></script>
+    <script src="../src/qr.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

@@ -1,0 +1,39 @@
+{
+  "manifest_version": 3,
+  "name": "OTP Autofill Authenticator",
+  "version": "1.6.0",
+  "description": "Detects login + 2FA forms and autofills TOTP codes. Smart two-step (email then OTP) flow. Import/export otpauth configs, scan QR codes.",
+  "permissions": ["storage", "activeTab", "scripting", "tabs", "contextMenus"],
+  "host_permissions": ["<all_urls>"],
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "OTP Autofill",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "background": {
+    "service_worker": "src/background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["src/totp.js", "src/otpauth.js", "src/storage.js", "src/content.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "commands": {
+    "fill-otp": {
+      "suggested_key": { "default": "Ctrl+Shift+9" },
+      "description": "Autofill the OTP code on the current page"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
