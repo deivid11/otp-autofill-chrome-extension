@@ -217,7 +217,14 @@
         .toLowerCase();
       const named = /otp|token|2fa|mfa|verif|c[oó]digo|\bcode\b/.test(hay);
       if (ac.includes("one-time-code") && (ml === 0 || ml >= 4)) return true;
-      return named && ml >= 4 && ml <= 10;
+      if (named && ml >= 4 && ml <= 10) return true;
+      // No maxlength at all (e.g. <input name="totpmfa" placeholder="123456">):
+      // accept only on an OTP-specific name or a named field whose placeholder
+      // is all digits, so generic "code"/"token" fields don't match.
+      if (ml !== 0) return false;
+      const strong = /otp|totp|mfa|2fa|one[-_]?time|verif/.test(hay);
+      const digitsPlaceholder = /^\d{4,8}$/.test((el.placeholder || "").trim());
+      return strong || (named && digitsPlaceholder);
     });
     if (single) return { mode: "single", inputs: [single] };
 

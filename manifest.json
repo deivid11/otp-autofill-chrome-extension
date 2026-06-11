@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "OTP Autofill Authenticator",
-  "version": "1.7.1",
+  "version": "1.7.2",
   "description": "Detects login + 2FA forms and autofills TOTP codes. Two-step email flow, QR scan, encrypted vault, otpauth import/export.",
   "permissions": [
     "storage",
