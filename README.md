@@ -10,7 +10,7 @@ No external services, no build step, no telemetry. Codes are computed locally
 with the Web Crypto API; secrets never leave your machine.
 
 <p align="center">
-  <img src="docs/images/autofill.png" width="430" alt="Autofilling a 6-digit OTP confirmation screen">
+  <img src="docs/images/login-autofill.png" width="460" alt="Autofilling the 6-digit code on a sign-in two-factor screen">
 </p>
 
 ---

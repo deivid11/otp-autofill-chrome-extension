@@ -38,30 +38,34 @@ await sw.evaluate(() => chrome.storage.local.set({ accounts: [{
 }] }));
 
 const errors = [];
+let nativeDialogs = 0;
 const popup = await context.newPage();
 popup.on("pageerror", (e) => errors.push(e.message));
-let dialogAction = "dismiss";
-popup.on("dialog", async (d) => { try { dialogAction === "accept" ? await d.accept() : await d.dismiss(); } catch (e) {} });
+// there should be NO native dialogs anymore — record any that slip through
+popup.on("dialog", async (d) => { nativeDialogs++; try { await d.dismiss(); } catch (e) {} });
 await popup.setViewportSize({ width: 360, height: 600 });
 await popup.goto(`chrome-extension://${extId}/popup/popup.html`, { waitUntil: "domcontentloaded" });
 await popup.waitForTimeout(300);
 
 console.log("popup loaded w/o errors:", errors.length === 0 ? "PASS" : `FAIL (${errors[0]})`);
 
+// drive the in-frame confirm modal by clicking a button (no native dialog)
+async function runImportAnswering(value, button) {
+  await popup.evaluate((v) => { document.getElementById("importText").value = v; }, value);
+  const pending = popup.evaluate(() => window.doImport()); // blocks on the modal
+  await popup.waitForSelector("#modal:not(.hidden)", { timeout: 3000 });
+  await popup.click(button);
+  await pending;
+}
+
 // Test A: duplicate, user declines override -> skipped + warning
-dialogAction = "dismiss";
-await popup.evaluate((v) => { document.getElementById("importText").value = v; }, SAME);
-await popup.evaluate(() => window.doImport());
-await popup.waitForTimeout(300);
+await runImportAnswering(SAME, "#modalCancel");
 let result = await popup.locator("#importResult").textContent();
 let cards = await popup.locator(".card").count();
 console.log("A decline override:", /skipped 1 duplicate/i.test(result) && cards === 1 ? `PASS ("${result}")` : `FAIL ("${result}", cards=${cards})`);
 
 // Test B: same identity, different secret, user accepts override -> overridden
-dialogAction = "accept";
-await popup.evaluate((v) => { document.getElementById("importText").value = v; }, DIFF);
-await popup.evaluate(() => window.doImport());
-await popup.waitForTimeout(300);
+await runImportAnswering(DIFF, "#modalOk");
 result = await popup.locator("#importResult").textContent();
 const stored = await sw.evaluate(() => globalThis.OTP.getAccounts());
 console.log("B accept override:", /overrode 1/i.test(result) && stored.length === 1 && stored[0].secret === "JBSWY3DPEHPK3PXP"
@@ -81,6 +85,20 @@ await popup.evaluate(() => window.openSettings());
 const hasExportBtn = await popup.locator("#exportFromSettingsBtn").isVisible();
 const noOldRow = (await popup.locator("#addBtn").count()) === 0 && (await popup.locator("#exportBtn").count()) === 0;
 console.log("D export in settings + old buttons gone:", hasExportBtn && noOldRow ? "PASS" : `FAIL (export=${hasExportBtn}, gone=${noOldRow})`);
+
+// Test E: delete uses the in-frame modal; capture it; no native dialogs at all
+await popup.evaluate(() => window.showView("accountsView"));
+const delPending = popup.evaluate(() => window.deleteAccount("a1"));
+await popup.waitForSelector("#modal:not(.hidden)", { timeout: 3000 });
+const modalInFrame = await popup.evaluate(() => {
+  const b = document.querySelector(".modal-box").getBoundingClientRect();
+  return b.left >= 0 && b.right <= window.innerWidth && b.top >= 0 && b.bottom <= window.innerHeight;
+});
+await popup.screenshot({ path: "/tmp/modal.png" });
+await popup.click("#modalCancel");
+await delPending;
+console.log("E modal fits inside the frame:", modalInFrame ? "PASS" : "FAIL");
+console.log("E no native dialogs used:", nativeDialogs === 0 ? "PASS" : `FAIL (${nativeDialogs})`);
 
 await context.close();
 process.exit(0);

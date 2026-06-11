@@ -43,6 +43,7 @@ function showView(id) {
 
 let editingId = null;
 let tickTimer = null;
+let accountById = new Map(); // id -> account, refreshed by renderAccounts
 
 // ---- toast ----------------------------------------------------------------
 function toast(msg, type) {
@@ -52,6 +53,38 @@ function toast(msg, type) {
   if (type === "warn") t.classList.add("warn");
   clearTimeout(toast._t);
   toast._t = setTimeout(() => t.classList.add("hidden"), type === "warn" ? 2400 : 1700);
+}
+
+// ---- in-frame confirm (replaces native confirm/alert) ---------------------
+function confirmDialog(message, opts = {}) {
+  const { okText = "OK", cancelText = "Cancel", danger = false } = opts;
+  return new Promise((resolve) => {
+    const modal = $("modal");
+    const ok = $("modalOk");
+    const cancel = $("modalCancel");
+    $("modalMsg").textContent = message;
+    ok.textContent = okText;
+    cancel.textContent = cancelText;
+    ok.className = danger ? "danger" : "primary";
+    modal.classList.remove("hidden");
+    ok.focus();
+
+    const close = (val) => {
+      modal.classList.add("hidden");
+      ok.onclick = cancel.onclick = null;
+      document.removeEventListener("keydown", onKey, true);
+      modal.onclick = null;
+      resolve(val);
+    };
+    const onKey = (e) => {
+      if (e.key === "Escape") { e.preventDefault(); close(false); }
+      else if (e.key === "Enter") { e.preventDefault(); close(true); }
+    };
+    ok.onclick = () => close(true);
+    cancel.onclick = () => close(false);
+    modal.onclick = (e) => { if (e.target === modal) close(false); }; // click backdrop
+    document.addEventListener("keydown", onKey, true);
+  });
 }
 
 // ---- account list rendering -----------------------------------------------
@@ -67,6 +100,7 @@ function matchesQuery(acc, q) {
 
 async function renderAccounts() {
   const all = await getAccounts();
+  accountById = new Map(all.map((a) => [a.id, a]));
   const q = searchQuery.trim().toLowerCase();
   const accounts = all.filter((a) => matchesQuery(a, q));
   const list = $("accountList");
@@ -111,10 +145,8 @@ async function renderAccounts() {
 }
 
 async function tick() {
-  const accounts = await getAccounts();
-  const byId = Object.fromEntries(accounts.map((a) => [a.id, a]));
   for (const card of document.querySelectorAll(".card")) {
-    const acc = byId[card.dataset.id];
+    const acc = accountById.get(card.dataset.id);
     if (!acc) continue;
     try {
       const code = await generateTOTP(acc);
@@ -256,7 +288,7 @@ async function saveAccount() {
 async function deleteAccount(id) {
   const accounts = await getAccounts();
   const acc = accounts.find((a) => a.id === id);
-  if (!confirm(`Delete ${displayName(acc)}?`)) return;
+  if (!(await confirmDialog(`Delete “${displayName(acc)}”?`, { okText: "Delete", danger: true }))) return;
   await saveAccounts(accounts.filter((a) => a.id !== id));
   await renderAccounts();
 }
@@ -286,10 +318,10 @@ async function doImport() {
     if (idx >= 0) {
       const existing = accounts[idx];
       const identical = existing.secret === p.secret;
-      const prompt = identical
+      const message = identical
         ? `“${displayName(p)}” is already in your list.\n\nOverride it anyway?`
         : `“${displayName(p)}” already exists, but with a DIFFERENT secret.\n\nOverride it with the imported one?`;
-      if (confirm(prompt)) {
+      if (await confirmDialog(message, { okText: "Override", cancelText: "Skip" })) {
         p.id = existing.id; // keep the same slot
         accounts[idx] = p;
         overridden++;
@@ -532,7 +564,7 @@ for (const id of [
   $(id).addEventListener("change", persistSettings);
 }
 $("clearRememberedBtn").onclick = async () => {
-  if (!confirm("Forget all remembered logins?")) return;
+  if (!(await confirmDialog("Forget all remembered logins?", { okText: "Forget all", danger: true }))) return;
   await clearDomainEmails();
   await renderRemembered();
   toast("Cleared");

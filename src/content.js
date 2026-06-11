@@ -158,8 +158,8 @@
     return false;
   }
 
-  function findEmailInput() {
-    const inputs = deepQueryAllInputs().filter(isVisible);
+  function findEmailInput(allInputs) {
+    const inputs = (allInputs || deepQueryAllInputs()).filter(isVisible);
     // prefer type=email, then anything that looks like an email/username field
     return (
       inputs.find((el) => el.type === "email") ||
@@ -168,16 +168,16 @@
     );
   }
 
-  function findPasswordInput() {
-    return deepQueryAllInputs()
+  function findPasswordInput(allInputs) {
+    return (allInputs || deepQueryAllInputs())
       .filter((el) => el.type === "password")
       .find(isVisible);
   }
 
   // Locate OTP inputs: either a single one-time-code field or a row of
   // single-character boxes (the most common 2FA pattern).
-  function findOtpInputs() {
-    const all = deepQueryAllInputs().filter(isVisible);
+  function findOtpInputs(allInputs) {
+    const all = (allInputs || deepQueryAllInputs()).filter(isVisible);
 
     // Single field meant to hold the whole code. A maxlength of 1 means the
     // field is actually one cell of a box grid, so it is excluded here even if
@@ -238,9 +238,11 @@
 
     if (boxes.length >= 4) {
       // sort by document position so digits land in the right order
+      // (cache each rect so the comparator doesn't force a reflow per compare)
+      const rects = new Map(boxes.map((el) => [el, el.getBoundingClientRect()]));
       boxes.sort((a, b) => {
-        const ra = a.getBoundingClientRect();
-        const rb = b.getBoundingClientRect();
+        const ra = rects.get(a);
+        const rb = rects.get(b);
         return ra.top - rb.top || ra.left - rb.left;
       });
       return { mode: "grid", inputs: boxes };
@@ -460,16 +462,21 @@
 
   // ---- main scan -----------------------------------------------------------
 
-  async function doFill(reason) {
-    const otp = findOtpInputs();
+  // ctx lets the main scan hand over the OTP target + picked account it already
+  // resolved, so the auto-fill path doesn't re-walk the DOM and re-read storage.
+  async function doFill(reason, ctx) {
+    const otp = (ctx && ctx.otp) || findOtpInputs();
     if (!otp) return false;
-    const accounts = await getAccounts();
-    const picked = await pickAccount(accounts);
+    let picked = ctx && ctx.picked;
     if (!picked) {
-      if (accounts.length) {
-        showButton("No matching account", () => {});
+      const accounts = await getAccounts();
+      picked = await pickAccount(accounts);
+      if (!picked) {
+        if (accounts.length) {
+          showButton("No matching account", () => {});
+        }
+        return false;
       }
-      return false;
     }
     const code = await generateTOTP(picked.account);
     dbg("doFill", { reason, account: picked.account.account, code, mode: otp.mode });
@@ -484,9 +491,17 @@
   async function scan() {
     scanScheduled = false;
 
-    const otp = findOtpInputs();
-    const passwordInput = findPasswordInput();
-    const emailInput = findEmailInput();
+    // One DOM/shadow-DOM walk per scan, shared by all three field detectors.
+    const allInputs = deepQueryAllInputs();
+    const otp = findOtpInputs(allInputs);
+    const passwordInput = findPasswordInput(allInputs);
+    const emailInput = findEmailInput(allInputs);
+
+    // Feed the adaptive backoff: a page with no auth-related field is "idle",
+    // so the safety-net re-scan can slow down instead of running forever.
+    if (otp || passwordInput || emailInput) idleScans = 0;
+    else idleScans++;
+
     dbg("scan", {
       otp: otp ? otp.mode + ":" + otp.inputs.length : null,
       hasPassword: !!passwordInput,
@@ -496,8 +511,7 @@
     });
     // When nothing was detected, dump every input so we can see why.
     if (DEBUG && !otp && !passwordInput) {
-      const all = deepQueryAllInputs();
-      dbg("all inputs (" + all.length + "):", all.map(describeInput));
+      dbg("all inputs (" + allInputs.length + "):", allInputs.map(describeInput));
     }
 
     // Step 1: capture the email so step 2 can match the right account.
@@ -523,7 +537,7 @@
           // Auto-fill a given OTP screen only once: some widgets clear the
           // hidden input after reading it, which would otherwise loop forever.
           if (lastFilledKey !== key) {
-            const ok = await doFill(picked.reason);
+            const ok = await doFill(picked.reason, { otp, picked });
             if (ok) lastFilledKey = key;
           }
         } else {
@@ -539,9 +553,37 @@
   }
 
   function scheduleScan() {
-    if (scanScheduled) return;
+    if (scanScheduled || document.hidden) return;
     scanScheduled = true;
     setTimeout(scan, 200);
+  }
+
+  // Safety-net re-scan for SPA screen swaps the MutationObserver can't see
+  // (shadow-root changes, visibility toggles). It runs fast while an auth flow
+  // is on the page and backs off hard on ordinary pages, so the extension is
+  // not walking the DOM of every open tab every 1.2s forever — the main source
+  // of idle CPU drain.
+  let idleScans = 0;
+  let periodicTimer = null;
+
+  function periodicDelay() {
+    if (idleScans < 3) return 1200; // active auth flow: stay responsive
+    if (idleScans < 6) return 4000;
+    return 10000; // ordinary page: just an occasional safety check
+  }
+
+  function schedulePeriodic() {
+    clearTimeout(periodicTimer);
+    if (document.hidden) return; // never scan a background tab
+    periodicTimer = setTimeout(() => {
+      scheduleScan();
+      schedulePeriodic();
+    }, periodicDelay());
+  }
+
+  function resetPeriodic() {
+    idleScans = 0;
+    schedulePeriodic();
   }
 
   // ---- capture email on the fly --------------------------------------------
@@ -564,16 +606,44 @@
     document.addEventListener("input", onUserInput, true);
     document.addEventListener("change", onUserInput, true);
 
-    const observer = new MutationObserver(() => scheduleScan());
+    // Only react to mutations that actually add input-bearing nodes. Most SPA
+    // churn (chat apps, mail, feeds) adds no inputs and previously triggered a
+    // full DOM walk on every change for nothing.
+    const observer = new MutationObserver((mutations) => {
+      for (const m of mutations) {
+        for (const node of m.addedNodes) {
+          if (node.nodeType !== 1) continue; // elements only
+          if (
+            node.tagName === "INPUT" ||
+            node.shadowRoot ||
+            (node.querySelector && node.querySelector("input"))
+          ) {
+            resetPeriodic(); // a form just changed — scan eagerly again
+            scheduleScan();
+            return;
+          }
+        }
+      }
+    });
     observer.observe(document.documentElement, {
       childList: true,
       subtree: true,
     });
 
     // Light-DOM mutations don't fire for changes inside shadow roots, and some
-    // SPAs swap screens without a mutation the observer catches. A cheap
-    // periodic re-scan guarantees we still notice the OTP screen appearing.
-    setInterval(scheduleScan, 1200);
+    // SPAs swap screens without a mutation the observer catches. The adaptive
+    // safety-net re-scan still notices the OTP screen appearing.
+    schedulePeriodic();
+
+    // Don't scan background tabs at all; resume eagerly when shown again.
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) {
+        clearTimeout(periodicTimer);
+      } else {
+        resetPeriodic();
+        scheduleScan();
+      }
+    });
 
     // react to settings changes from the popup without a reload
     chrome.storage.onChanged.addListener((changes, area) => {
