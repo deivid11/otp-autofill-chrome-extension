@@ -59,5 +59,14 @@ if (btn) {
   console.log("AFTER click:", JSON.stringify(vals));
 }
 
+// QR on the page: decode it with the extension's own scanner pipeline
+const popup = await context.newPage();
+await popup.goto(`chrome-extension://${new URL(sw.url()).host}/popup/popup.html`, { waitUntil: "domcontentloaded" });
+const qrDecoded = await popup.evaluate(async () => {
+  const blob = await (await fetch("https://authenticationtest.com/assets/I65VU7K5ZQL7WB4E.png", { credentials: "omit" })).blob();
+  return globalThis.OTP.qr.decodeFromBlob(blob);
+});
+console.log("QR decodes:", qrDecoded && /^otpauth:\/\/totp/i.test(qrDecoded) ? `PASS (${qrDecoded})` : `FAIL (${qrDecoded})`);
+
 await context.close();
 process.exit(0);
