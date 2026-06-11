@@ -51,6 +51,41 @@ Exports are encrypted with a passphrase you choose (PBKDF2 + AES-256-GCM) by
 default; a plaintext export exists behind an explicit warning. Either way the
 file is generated locally and saved only where you choose.
 
+## Disclaimer — no warranty, use at your own risk
+
+This extension is free, open-source software distributed under the
+[MIT License](LICENSE). It is provided **"as is" and "as available", without
+warranty of any kind**, express or implied, including but not limited to
+merchantability, fitness for a particular purpose, accuracy, or
+non-infringement.
+
+By installing or using the extension you acknowledge and accept that:
+
+- **You are responsible for backups.** Two-factor secrets exist only on your
+  device. If you lose them — including by forgetting your master password or
+  a backup passphrase, for which there is **no recovery mechanism by
+  design** — you may be permanently locked out of your online accounts.
+- **You are responsible for your device.** No extension can protect secrets
+  on a device or browser profile that is already compromised (malware, an
+  attacker with local access, other malicious software).
+- **You decide where codes are filled.** The first autofill on every site
+  requires your explicit approval; approving or manually entering a code on a
+  fraudulent site is outside the extension's control.
+- The extension is an independent project, not affiliated with or endorsed by
+  any website or service it generates codes for.
+
+**Limitation of liability:** to the maximum extent permitted by applicable
+law, the author shall not be liable for any direct, indirect, incidental,
+consequential, exemplary, or special damages — including but not limited to
+account lockouts, data loss, unauthorized access to accounts, lost profits,
+or any other loss — arising from or related to the use of, or inability to
+use, this software, even if advised of the possibility of such damages. Your
+sole and exclusive remedy is to stop using the extension.
+
+## Reporting security issues
+
+Please see [SECURITY.md](SECURITY.md) for the responsible-disclosure process.
+
 ## Changes & contact
 
 Changes to this policy will be published in this repository. Questions or

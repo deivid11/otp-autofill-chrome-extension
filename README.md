@@ -308,3 +308,12 @@ RFC 6238 test vectors.
   or Chromium (automated tests).
 - If you forget the master password or a backup passphrase, that data is
   unrecoverable by design.
+
+## License & disclaimer
+
+[MIT](LICENSE) — free to use, modify and redistribute. Provided **"as is",
+without warranty of any kind**; the author is not liable for account
+lockouts, data loss, or any damages arising from its use (see the full
+disclaimer in [PRIVACY.md](PRIVACY.md) and the security model in
+[SECURITY.md](SECURITY.md)). Keep an encrypted backup of your accounts —
+lost secrets and forgotten passwords are unrecoverable by design.
