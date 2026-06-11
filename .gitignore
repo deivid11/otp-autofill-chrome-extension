@@ -1,6 +1,9 @@
 # dependencies
 node_modules/
 
+# store packages and generated listing assets
+dist/
+
 # Playwright test profiles (Chromium user-data dirs) and artifacts
 test/e2e/.profile*
 
