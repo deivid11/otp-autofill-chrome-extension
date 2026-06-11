@@ -2,7 +2,7 @@
 // the file picker when none is found. We stub captureVisibleTab/decode to drive
 // both branches (the real capture+jsQR path is covered by run-qr.mjs).
 import { chromium } from "playwright-core";
-import { readFileSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
 
@@ -22,6 +22,8 @@ function chromePath() {
   return undefined;
 }
 
+// start clean: a reused profile caches the previous service worker
+rmSync(join(__dirname, ".profile-scan"), { recursive: true, force: true });
 const context = await chromium.launchPersistentContext(join(__dirname, ".profile-scan"), {
   headless: false,
   executablePath: chromePath(),

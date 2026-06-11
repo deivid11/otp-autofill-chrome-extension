@@ -4,7 +4,7 @@
 // All sample data is generic (example.com), never real accounts.
 import { chromium } from "playwright-core";
 import { createServer } from "node:http";
-import { readFileSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
 
@@ -40,6 +40,8 @@ function chromePath() {
   return undefined;
 }
 
+// start clean: a reused profile caches the previous service worker
+rmSync(join(__dirname, ".profile-shots"), { recursive: true, force: true });
 const context = await chromium.launchPersistentContext(join(__dirname, ".profile-shots"), {
   headless: false, executablePath: chromePath(),
   args: ["--headless=new", "--disable-gpu", "--no-sandbox", "--force-device-scale-factor=2",
@@ -55,7 +57,7 @@ const extId = new URL(sw.url()).host;
 // generic sample accounts + remembered login for the hero page's host
 await sw.evaluate(() => chrome.storage.local.set({
   accounts: [
-    { id: "1", type: "totp", issuer: "Northwind", account: "alex.rivera@example.com", secret: "MFRGGZDFMZTWQ2LK", algorithm: "SHA1", digits: 6, period: 30 },
+    { id: "1", type: "totp", issuer: "Northwind", account: "alex.rivera@example.com", secret: "MFRGGZDFMZTWQ2LK", algorithm: "SHA1", digits: 6, period: 30, domains: ["127.0.0.1", "example.com"] },
     { id: "2", type: "totp", issuer: "Globex VPN", account: "", secret: "KRSXG5CTMVRXEZLU", algorithm: "SHA1", digits: 6, period: 30 },
     { id: "3", type: "totp", issuer: "Initech", account: "jordan.kim@example.com", secret: "NB2W45DFOIZA====", algorithm: "SHA1", digits: 6, period: 30 },
   ],

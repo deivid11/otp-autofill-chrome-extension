@@ -2,27 +2,15 @@
 // Detects login (step 1) and OTP (step 2) forms, captures the email entered on
 // step 1, and autofills the matching TOTP code on step 2. Works on SPA flows
 // where both steps live on the same origin without a full page reload.
+//
+// This script holds NO secrets and loads no crypto/storage code: it asks the
+// background worker for at most a ready-made 6-digit code. The background
+// decides per sender origin whether the page may receive one (domain binding,
+// cross-origin-iframe block, vault lock).
 
 (function () {
-  if (!globalThis.OTP) {
-    console.error("[OTP-AF] globalThis.OTP is undefined — lib scripts did not run");
-    return;
-  }
-  const { generateTOTP } = globalThis.OTP;
-  const {
-    normalizeEmail,
-    registrableDomain,
-    getAccounts,
-    getSettings,
-    setCapturedEmail,
-    getCapturedEmail,
-    setDomainEmail,
-    getDomainEmail,
-  } = globalThis.OTP;
-
-  const ORIGIN = location.origin;
-  const DOMAIN = registrableDomain(location.hostname);
-  let settings = globalThis.OTP.DEFAULT_SETTINGS;
+  let settings = { autoFill: false, autoSubmit: false, showButton: true, debug: false };
+  let ctx = null; // last ctx.get response from the background
   let scanScheduled = false;
   let lastFilledKey = null; // guards against auto-refilling the same OTP screen
 
@@ -31,13 +19,50 @@
     if (DEBUG) console.log("[OTP-AF]", ...a);
   };
 
-  // Remember an email both for the immediate two-step flow (session, per-origin)
-  // and durably per-domain so standalone OTP screens can still match it later.
-  function captureEmail(value) {
+  // promise wrapper over sendMessage; null when the background is unreachable
+  function sendBg(msg) {
+    return new Promise((resolve) => {
+      try {
+        chrome.runtime.sendMessage(msg, (resp) => {
+          void chrome.runtime.lastError;
+          resolve(resp || null);
+        });
+      } catch (e) {
+        resolve(null);
+      }
+    });
+  }
+
+  async function ensureCtx() {
+    if (!ctx) {
+      ctx = await sendBg({ type: "ctx.get" });
+      if (ctx && ctx.settings) {
+        settings = ctx.settings;
+        DEBUG = !!settings.debug;
+      }
+    }
+    return ctx;
+  }
+
+  // Remember an email for the immediate two-step flow and (if enabled) durably
+  // per domain. The background validates and keys it by this frame's origin.
+  // Debounced + deduped: input events fire per keystroke and the periodic
+  // scan re-sees the same value, which used to mean a message + storage
+  // writes each time. flush=true (change/blur) sends immediately so the email
+  // isn't lost when submitting navigates to a new document.
+  const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+  let emailTimer = null;
+  let lastSentEmail = "";
+  function captureEmail(value, flush) {
     const v = (value || "").trim();
-    if (!v || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(v)) return;
-    setCapturedEmail(ORIGIN, v);
-    if (settings.rememberDomainEmail) setDomainEmail(DOMAIN, v);
+    if (!v || v === lastSentEmail || !EMAIL_RE.test(v)) return;
+    clearTimeout(emailTimer);
+    const send = () => {
+      lastSentEmail = v;
+      sendBg({ type: "email.captured", email: v });
+    };
+    if (flush) send();
+    else emailTimer = setTimeout(send, 350);
   }
 
   // ---- field detection -----------------------------------------------------
@@ -265,6 +290,10 @@
     return target.inputs.every((el) => (el.value || "").trim().length >= 1);
   }
 
+  function otpKey(otp) {
+    return otp.mode + ":" + otp.inputs.length + ":" + location.pathname;
+  }
+
   // ---- value setting (React/Vue friendly) ----------------------------------
 
   function setNativeValue(el, value) {
@@ -365,48 +394,6 @@
     if (last) last.focus();
   }
 
-  // ---- account matching ----------------------------------------------------
-
-  function issuerMatchesHost(issuer, host) {
-    if (!issuer) return false;
-    const token = issuer.toLowerCase().split(/[^a-z0-9]+/)[0];
-    if (!token || token.length < 3) return false;
-    return host.toLowerCase().includes(token);
-  }
-
-  async function pickAccount(accounts) {
-    if (!accounts.length) return null;
-
-    // Try the email captured in this flow (session) first, then the durable
-    // last-login email remembered for this domain.
-    const candidates = [];
-    const sessionEmail = await getCapturedEmail(ORIGIN);
-    if (sessionEmail) candidates.push(sessionEmail);
-    const domainEmail = await getDomainEmail(DOMAIN);
-    if (domainEmail && domainEmail !== sessionEmail) candidates.push(domainEmail);
-
-    dbg("pickAccount candidates", candidates, "accounts", accounts.map((a) => a.account));
-    for (const email of candidates) {
-      const match = accounts.find(
-        (a) => normalizeEmail(a.account) === normalizeEmail(email)
-      );
-      if (match) return { account: match, reason: "email" };
-    }
-
-    if (settings.matchByIssuer) {
-      const byIssuer = accounts.find((a) =>
-        issuerMatchesHost(a.issuer, location.hostname)
-      );
-      if (byIssuer) return { account: byIssuer, reason: "issuer" };
-    }
-
-    if (settings.fallbackSingle && accounts.length === 1) {
-      return { account: accounts[0], reason: "only-account" };
-    }
-
-    return null;
-  }
-
   // ---- floating helper button ----------------------------------------------
 
   let buttonEl = null;
@@ -432,7 +419,11 @@
       (document.body || document.documentElement).appendChild(buttonEl);
     }
     buttonEl.textContent = label;
-    buttonEl.onclick = onClick;
+    // a page can synthesize click events on our button — only obey real ones
+    buttonEl.onclick = (e) => {
+      if (!e || !e.isTrusted) return;
+      onClick(e);
+    };
     buttonEl.style.display = "block";
   }
 
@@ -462,34 +453,44 @@
 
   // ---- main scan -----------------------------------------------------------
 
-  // ctx lets the main scan hand over the OTP target + picked account it already
-  // resolved, so the auto-fill path doesn't re-walk the DOM and re-read storage.
-  async function doFill(reason, ctx) {
-    const otp = (ctx && ctx.otp) || findOtpInputs();
-    if (!otp) return false;
-    let picked = ctx && ctx.picked;
-    if (!picked) {
-      const accounts = await getAccounts();
-      picked = await pickAccount(accounts);
-      if (!picked) {
-        if (accounts.length) {
-          showButton("No matching account", () => {});
-        }
-        return false;
-      }
-    }
-    const code = await generateTOTP(picked.account);
-    dbg("doFill", { reason, account: picked.account.account, code, mode: otp.mode });
+  function fillAndFinish(otp, code) {
     fillOtpInputs(otp, code);
+    lastFilledKey = otpKey(otp);
     if (settings.autoSubmit) {
       setTimeout(trySubmit, 250);
     }
     hideButton();
+  }
+
+  function openPopupForUnlock() {
+    sendBg({ type: "popup.open" });
+  }
+
+  // gesture=true marks an explicit user action (button click, popup "Fill
+  // tab", keyboard command) — required the first time a domain is used, and
+  // it makes the background remember the domain for next time.
+  async function doFill(reason, opts) {
+    const otp = (opts && opts.otp) || findOtpInputs();
+    if (!otp) return false;
+    const resp = await sendBg({
+      type: "code.request",
+      gesture: !!(opts && opts.gesture),
+    });
+    dbg("doFill", { reason, resp: resp && Object.keys(resp), mode: otp.mode });
+    if (!resp) return false;
+    if (resp.locked) {
+      showButton("Unlock OTP Autofill…", openPopupForUnlock);
+      return false;
+    }
+    if (!resp.ok) return false;
+    fillAndFinish(otp, resp.code);
     return true;
   }
 
   async function scan() {
     scanScheduled = false;
+    if (!(await ensureCtx())) return; // background not ready yet — next scan retries
+    if (ctx.blocked) return; // cross-site frame: never fills, so never scan
 
     // One DOM/shadow-DOM walk per scan, shared by all three field detectors.
     const allInputs = deepQueryAllInputs();
@@ -506,8 +507,7 @@
       otp: otp ? otp.mode + ":" + otp.inputs.length : null,
       hasPassword: !!passwordInput,
       hasEmail: !!emailInput,
-      origin: ORIGIN,
-      domain: DOMAIN,
+      origin: location.origin,
     });
     // When nothing was detected, dump every input so we can see why.
     if (DEBUG && !otp && !passwordInput) {
@@ -523,28 +523,43 @@
 
     // Step 2: OTP screen.
     if (otp) {
-      const key = otp.mode + ":" + otp.inputs.length + ":" + location.pathname;
+      const key = otpKey(otp);
       // Already populated (likely by us) — don't fight the SPA's re-renders.
       if (otpAlreadyFilled(otp)) {
         hideButton();
         return;
       }
-      const accounts = await getAccounts();
-      const picked = await pickAccount(accounts);
-      dbg("otp branch", { picked: picked ? picked.reason : null, autoFill: settings.autoFill, accounts: accounts.length, key });
-      if (picked) {
+      const resp = await sendBg({ type: "code.request", gesture: false });
+      dbg("otp branch", { resp, autoFill: settings.autoFill, key });
+      if (!resp || resp.blocked) {
+        hideButton();
+        return;
+      }
+      if (resp.locked) {
+        showButton("Unlock OTP Autofill…", openPopupForUnlock);
+        return;
+      }
+      if (resp.needsGesture) {
+        // first use on this domain: one explicit click binds it for next time
+        showButton("Fill OTP — " + (resp.label || "").slice(0, 40), () =>
+          doFill("bind-domain", { otp, gesture: true })
+        );
+        return;
+      }
+      if (resp.ok) {
         if (settings.autoFill) {
           // Auto-fill a given OTP screen only once: some widgets clear the
           // hidden input after reading it, which would otherwise loop forever.
           if (lastFilledKey !== key) {
-            const ok = await doFill(picked.reason, { otp, picked });
-            if (ok) lastFilledKey = key;
+            fillAndFinish(otp, resp.code);
           }
         } else {
-          showButton("Fill OTP code", () => doFill("manual"));
+          showButton("Fill OTP code", () => doFill("manual", { otp }));
         }
-      } else if (accounts.length) {
-        showButton("Fill OTP code", () => doFill("manual"));
+        return;
+      }
+      if (resp.none && resp.hasAccounts) {
+        showButton("No matching account", () => {});
       }
     } else {
       lastFilledKey = null; // left the OTP screen; allow the next one to fill
@@ -592,16 +607,23 @@
     const el = e.target;
     if (!el || el.tagName !== "INPUT") return;
     if (el.type !== "password" && looksLikeEmail(el)) {
-      captureEmail(el.value);
+      captureEmail(el.value, e.type === "change");
     }
   }
 
   // ---- wiring --------------------------------------------------------------
 
   async function init() {
-    settings = await getSettings();
-    DEBUG = !!settings.debug;
-    dbg("init", { href: location.href, origin: ORIGIN, domain: DOMAIN });
+    const initialCtx = await ensureCtx();
+    dbg("init", { href: location.href, origin: location.origin });
+
+    // A frame whose site differs from the top page can never receive a code,
+    // so don't burn CPU scanning it (ad-heavy pages embed dozens of frames).
+    // No listeners, observers or timers — this frame stays fully idle.
+    if (initialCtx && initialCtx.blocked) {
+      dbg("cross-site frame — scanner disabled");
+      return;
+    }
 
     document.addEventListener("input", onUserInput, true);
     document.addEventListener("change", onUserInput, true);
@@ -645,22 +667,20 @@
       }
     });
 
-    // react to settings changes from the popup without a reload
+    // react to settings changes from the popup without a reload (settings are
+    // not secret; accounts never transit this listener)
     chrome.storage.onChanged.addListener((changes, area) => {
       if (area === "local" && changes.settings) {
-        settings = Object.assign(
-          {},
-          globalThis.OTP.DEFAULT_SETTINGS,
-          changes.settings.newValue || {}
-        );
-        DEBUG = !!settings.debug;
+        ctx = null; // re-fetch on the next scan
+        ensureCtx();
       }
     });
 
-    // popup / keyboard command can force a fill
+    // popup / keyboard command can force a fill — these are explicit user
+    // actions, so they count as a gesture (and bind the domain)
     chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       if (msg && msg.type === "FILL_NOW") {
-        doFill("forced").then((ok) => sendResponse({ ok }));
+        doFill("forced", { gesture: true }).then((ok) => sendResponse({ ok }));
         return true; // async response
       }
       if (msg && msg.type === "PING") {

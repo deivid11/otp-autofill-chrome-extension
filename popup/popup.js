@@ -1,14 +1,11 @@
 // popup/popup.js
+// UI only. Account secrets, code generation, the vault and exports live in the
+// background worker; this page asks for them over messages. parseOtpauth /
+// parseImport run here only on text the user already pasted into this page.
 const {
-  generateTOTP,
-  secondsRemaining,
   parseOtpauth,
-  toOtpauth,
   parseImport,
-  normalizeAccount,
   displayName,
-  getAccounts,
-  saveAccounts,
   getSettings,
   saveSettings,
   getAllDomainEmails,
@@ -16,8 +13,19 @@ const {
   clearDomainEmails,
 } = globalThis.OTP;
 
+// promise wrapper over sendMessage to the background worker
+function bg(msg) {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage(msg, (resp) => {
+      void chrome.runtime.lastError;
+      resolve(resp || null);
+    });
+  });
+}
+
 const $ = (id) => document.getElementById(id);
 const views = [
+  "lockView",
   "accountsView",
   "addView",
   "importView",
@@ -43,7 +51,7 @@ function showView(id) {
 
 let editingId = null;
 let tickTimer = null;
-let accountById = new Map(); // id -> account, refreshed by renderAccounts
+let accountById = new Map(); // id -> sanitized account, refreshed by renderAccounts
 
 // ---- toast ----------------------------------------------------------------
 function toast(msg, type) {
@@ -55,7 +63,7 @@ function toast(msg, type) {
   toast._t = setTimeout(() => t.classList.add("hidden"), type === "warn" ? 2400 : 1700);
 }
 
-// ---- in-frame confirm (replaces native confirm/alert) ---------------------
+// ---- in-frame confirm / prompt (replaces native confirm/alert/prompt) ------
 function confirmDialog(message, opts = {}) {
   const { okText = "OK", cancelText = "Cancel", danger = false } = opts;
   return new Promise((resolve) => {
@@ -87,6 +95,91 @@ function confirmDialog(message, opts = {}) {
   });
 }
 
+// Same modal with a (password) input. Resolves the string, or null on cancel.
+function promptDialog(message, opts = {}) {
+  const { okText = "OK", cancelText = "Cancel", type = "password" } = opts;
+  return new Promise((resolve) => {
+    const modal = $("modal");
+    const ok = $("modalOk");
+    const cancel = $("modalCancel");
+    const input = $("modalInput");
+    $("modalMsg").textContent = message;
+    ok.textContent = okText;
+    cancel.textContent = cancelText;
+    ok.className = "primary";
+    input.type = type;
+    input.value = "";
+    input.classList.remove("hidden");
+    modal.classList.remove("hidden");
+    input.focus();
+
+    const close = (val) => {
+      modal.classList.add("hidden");
+      input.classList.add("hidden");
+      input.value = "";
+      ok.onclick = cancel.onclick = null;
+      document.removeEventListener("keydown", onKey, true);
+      modal.onclick = null;
+      resolve(val);
+    };
+    const onKey = (e) => {
+      if (e.key === "Escape") { e.preventDefault(); close(null); }
+      else if (e.key === "Enter") { e.preventDefault(); close(input.value); }
+    };
+    ok.onclick = () => close(input.value);
+    cancel.onclick = () => close(null);
+    modal.onclick = (e) => { if (e.target === modal) close(null); };
+    document.addEventListener("keydown", onKey, true);
+  });
+}
+
+// ---- vault lock screen ------------------------------------------------------
+
+function showLock() {
+  showView("lockView");
+  $("unlockError").classList.add("hidden");
+  $("unlockPassword").value = "";
+  $("unlockPassword").focus();
+}
+
+async function tryUnlock() {
+  const password = $("unlockPassword").value;
+  if (!password) return;
+  const resp = await bg({ type: "vault.unlock", password });
+  if (resp && resp.ok) {
+    $("unlockError").classList.add("hidden");
+    await renderAccounts();
+    showView("accountsView");
+  } else {
+    $("unlockError").classList.remove("hidden");
+    $("unlockPassword").select();
+  }
+}
+
+$("unlockBtn").onclick = tryUnlock;
+$("unlockPassword").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") tryUnlock();
+});
+
+// ---- "set a master password" nudge ------------------------------------------
+
+async function updateNudge(accountCount) {
+  const s = await getSettings();
+  const vs = await bg({ type: "vault.status" });
+  const show =
+    accountCount > 0 && vs && vs.state === "plain" && !s.vaultNudgeDismissed;
+  $("vaultNudge").classList.toggle("hidden", !show);
+}
+
+$("nudgeSetBtn").onclick = async () => {
+  await setMasterPassword();
+  await renderAccounts();
+};
+$("nudgeDismissBtn").onclick = async () => {
+  await saveSettings({ vaultNudgeDismissed: true });
+  $("vaultNudge").classList.add("hidden");
+};
+
 // ---- account list rendering -----------------------------------------------
 let searchQuery = "";
 
@@ -99,13 +192,20 @@ function matchesQuery(acc, q) {
 }
 
 async function renderAccounts() {
-  const all = await getAccounts();
+  const resp = await bg({ type: "accounts.list" });
+  if (!resp) return;
+  if (resp.locked) {
+    showLock();
+    return;
+  }
+  const all = resp.accounts;
   accountById = new Map(all.map((a) => [a.id, a]));
   const q = searchQuery.trim().toLowerCase();
   const accounts = all.filter((a) => matchesQuery(a, q));
   const list = $("accountList");
   list.innerHTML = "";
   $("emptyState").classList.toggle("hidden", all.length > 0);
+  await updateNudge(all.length);
 
   if (all.length > 0 && accounts.length === 0) {
     list.innerHTML = `<p class="muted" style="text-align:center;padding:16px;">No accounts match “${escapeHtml(searchQuery)}”.</p>`;
@@ -137,30 +237,65 @@ async function renderAccounts() {
     card.querySelector(".edit").onclick = () => startEdit(acc.id);
     card.querySelector(".del").onclick = () => deleteAccount(acc.id);
     const codeEl = card.querySelector(".code");
-    const copy = () => copyCode(acc);
+    const copy = () => copyCode(acc.id);
     codeEl.onclick = copy;
     card.querySelector(".copy").onclick = copy;
   }
   tick(); // immediate first paint of codes
 }
 
+// Codes change only when a TOTP window rolls over, and the countdown is pure
+// clock math — so the per-second tick renders locally and asks the background
+// for fresh codes once per window instead of every second (which decrypted
+// the vault and re-computed every HMAC each time).
+let codesById = new Map(); // id -> {code, period, error, win}
+
+function windowIndex(period) {
+  return Math.floor(Date.now() / 1000 / (period || 30));
+}
+
+function remainingFor(period) {
+  const p = period || 30;
+  return p - (Math.floor(Date.now() / 1000) % p);
+}
+
+async function fetchCodes() {
+  const resp = await bg({ type: "accounts.codes" });
+  if (!resp) return false;
+  if (resp.locked) {
+    // auto-lock fired while the popup is open
+    if (!$("accountsView").classList.contains("hidden")) showLock();
+    return false;
+  }
+  codesById = new Map(
+    resp.codes.map((c) => [c.id, Object.assign({ win: windowIndex(c.period) }, c)])
+  );
+  return true;
+}
+
 async function tick() {
-  for (const card of document.querySelectorAll(".card")) {
-    const acc = accountById.get(card.dataset.id);
-    if (!acc) continue;
-    try {
-      const code = await generateTOTP(acc);
-      const codeEl = card.querySelector(".code");
-      codeEl.textContent = spaced(code);
-      const remaining = secondsRemaining(acc.period);
-      const pct = (remaining / (acc.period || 30)) * 100;
-      const ring = card.querySelector(".ring");
-      ring.style.setProperty("--p", pct.toFixed(0));
-      card.querySelector(".secs").textContent = remaining;
-      codeEl.classList.toggle("dim", remaining <= 5);
-    } catch (e) {
-      card.querySelector(".code").textContent = "error";
+  const cards = document.querySelectorAll(".card");
+  if (!cards.length) return;
+  const stale = [...cards].some((card) => {
+    const c = codesById.get(card.dataset.id);
+    return !c || (!c.error && c.win !== windowIndex(c.period));
+  });
+  if (stale && !(await fetchCodes())) return;
+  for (const card of cards) {
+    const c = codesById.get(card.dataset.id);
+    if (!c) continue;
+    const codeEl = card.querySelector(".code");
+    if (c.error) {
+      codeEl.textContent = "error";
+      continue;
     }
+    codeEl.textContent = spaced(c.code);
+    const remaining = remainingFor(c.period);
+    const pct = (remaining / (c.period || 30)) * 100;
+    const ring = card.querySelector(".ring");
+    ring.style.setProperty("--p", pct.toFixed(0));
+    card.querySelector(".secs").textContent = remaining;
+    codeEl.classList.toggle("dim", remaining <= 5);
   }
 }
 
@@ -170,9 +305,18 @@ function spaced(code) {
   return code;
 }
 
-async function copyCode(acc) {
-  const code = await generateTOTP(acc);
-  await navigator.clipboard.writeText(code);
+async function copyCode(id) {
+  const resp = await bg({ type: "accounts.code", id });
+  if (!resp || resp.error) {
+    toast("Code unavailable", "warn");
+    return;
+  }
+  if (resp.locked) {
+    showLock();
+    return;
+  }
+  await navigator.clipboard.writeText(resp.code);
+  bg({ type: "clipboard.scheduleClear", text: resp.code });
   toast("Code copied");
 }
 
@@ -192,6 +336,7 @@ function clearForm() {
   $("f_algorithm").value = "SHA1";
   $("f_digits").value = "6";
   $("f_period").value = "30";
+  $("domainsBox").classList.add("hidden");
 }
 
 function startAdd() {
@@ -200,9 +345,39 @@ function startAdd() {
   showView("addView");
 }
 
+function renderDomains(acc) {
+  const box = $("domainsBox");
+  const list = $("domainsList");
+  box.classList.remove("hidden");
+  list.innerHTML = "";
+  const domains = acc.domains || [];
+  if (!domains.length) {
+    list.innerHTML =
+      '<p class="muted" style="margin:0;">None yet — a site is allowed the first time you click “Fill OTP” on it.</p>';
+    return;
+  }
+  for (const d of domains) {
+    const chip = document.createElement("span");
+    chip.className = "domain-chip";
+    chip.innerHTML = `${escapeHtml(d)}<button title="Forget this site">✕</button>`;
+    chip.querySelector("button").onclick = async () => {
+      await bg({ type: "accounts.removeDomain", id: acc.id, domain: d });
+      const fresh = await bg({ type: "accounts.get", id: acc.id });
+      if (fresh && fresh.account) renderDomains(fresh.account);
+      toast("Site forgotten");
+    };
+    list.appendChild(chip);
+  }
+}
+
 async function startEdit(id) {
-  const accounts = await getAccounts();
-  const acc = accounts.find((a) => a.id === id);
+  const resp = await bg({ type: "accounts.get", id });
+  if (!resp) return;
+  if (resp.locked) {
+    showLock();
+    return;
+  }
+  const acc = resp.account;
   if (!acc) return;
   editingId = id;
   $("addTitle").textContent = "Edit account";
@@ -213,6 +388,7 @@ async function startEdit(id) {
   $("f_algorithm").value = acc.algorithm || "SHA1";
   $("f_digits").value = acc.digits || 6;
   $("f_period").value = acc.period || 30;
+  renderDomains(acc);
   showView("addView");
 }
 
@@ -256,95 +432,130 @@ $("addQrFile").addEventListener("change", async (e) => {
 });
 
 async function saveAccount() {
-  const acc = normalizeAccount({
-    id: editingId || undefined,
-    issuer: $("f_issuer").value,
-    account: $("f_account").value,
-    secret: $("f_secret").value,
-    algorithm: $("f_algorithm").value,
-    digits: $("f_digits").value,
-    period: $("f_period").value,
-  });
-  if (!acc.secret) {
+  if (!$("f_secret").value.trim()) {
     toast("Secret is required");
     return;
   }
-  try {
-    await generateTOTP(acc); // validate the secret decodes
-  } catch (e) {
-    toast("Invalid base32 secret");
+  const resp = await bg({
+    type: "accounts.save",
+    account: {
+      id: editingId || undefined,
+      issuer: $("f_issuer").value,
+      account: $("f_account").value,
+      secret: $("f_secret").value,
+      algorithm: $("f_algorithm").value,
+      digits: $("f_digits").value,
+      period: $("f_period").value,
+    },
+  });
+  if (!resp) return;
+  if (resp.locked) {
+    showLock();
     return;
   }
-  const accounts = await getAccounts();
-  const idx = accounts.findIndex((a) => a.id === acc.id);
-  if (idx >= 0) accounts[idx] = acc;
-  else accounts.push(acc);
-  await saveAccounts(accounts);
+  if (resp.error) {
+    toast(resp.error, "warn");
+    return;
+  }
   showView("accountsView");
   await renderAccounts();
-  toast(idx >= 0 ? "Updated" : "Added");
+  toast(resp.updated ? "Updated" : "Added");
 }
 
 async function deleteAccount(id) {
-  const accounts = await getAccounts();
-  const acc = accounts.find((a) => a.id === id);
-  if (!(await confirmDialog(`Delete “${displayName(acc)}”?`, { okText: "Delete", danger: true }))) return;
-  await saveAccounts(accounts.filter((a) => a.id !== id));
+  const acc = accountById.get(id);
+  if (!(await confirmDialog(`Delete “${displayName(acc || {})}”?`, { okText: "Delete", danger: true }))) return;
+  const resp = await bg({ type: "accounts.remove", id });
+  if (resp && resp.locked) {
+    showLock();
+    return;
+  }
   await renderAccounts();
 }
 
 // ---- import ---------------------------------------------------------------
-// Two accounts are "the same" if they share issuer + account label.
-function sameIdentity(a, b) {
-  const norm = (s) => (s || "").trim().toLowerCase();
-  return norm(a.account) === norm(b.account) && norm(a.issuer) === norm(b.issuer);
+
+// Detect our passphrase-encrypted backup format.
+function tryParseEnvelope(text) {
+  const trimmed = String(text || "").trim();
+  if (!trimmed.startsWith("{")) return null;
+  try {
+    const obj = JSON.parse(trimmed);
+    return obj && obj.type === "otp-export-encrypted" ? obj : null;
+  } catch (e) {
+    return null;
+  }
 }
 
 async function doImport() {
   const text = $("importText").value;
+
+  // Encrypted backup: ask for the passphrase, decrypt in the background, then
+  // run the normal import over the recovered otpauth URIs.
+  const envelope = tryParseEnvelope(text);
+  if (envelope) {
+    const pass = await promptDialog("This is an encrypted backup. Enter its passphrase:", { okText: "Decrypt" });
+    if (pass == null) return;
+    const dec = await bg({ type: "accounts.decryptImport", envelope, passphrase: pass });
+    if (!dec || dec.error) {
+      $("importResult").textContent = "Could not decrypt the backup — wrong passphrase?";
+      toast("Wrong passphrase", "warn");
+      return;
+    }
+    $("importText").value = dec.text;
+    return doImport();
+  }
+
   const parsed = parseImport(text);
   if (!parsed.length) {
     $("importResult").textContent = "No valid otpauth URIs or JSON found.";
     toast("Nothing to import", "warn");
     return;
   }
-  const accounts = await getAccounts();
   let added = 0,
     overridden = 0,
-    skipped = 0;
+    skipped = 0,
+    rejected = 0;
+  let rejectReason = "";
 
   for (const p of parsed) {
-    const idx = accounts.findIndex((a) => sameIdentity(a, p));
-    if (idx >= 0) {
-      const existing = accounts[idx];
-      const identical = existing.secret === p.secret;
-      const message = identical
+    let resp = await bg({ type: "accounts.importOne", account: p });
+    if (!resp) continue;
+    if (resp.locked) {
+      showLock();
+      return;
+    }
+    if (resp.status === "hotp" || resp.status === "invalid") {
+      rejected++;
+      rejectReason = resp.error || "";
+      continue;
+    }
+    if (resp.status === "dup") {
+      const message = resp.sameSecret
         ? `“${displayName(p)}” is already in your list.\n\nOverride it anyway?`
         : `“${displayName(p)}” already exists, but with a DIFFERENT secret.\n\nOverride it with the imported one?`;
       if (await confirmDialog(message, { okText: "Override", cancelText: "Skip" })) {
-        p.id = existing.id; // keep the same slot
-        accounts[idx] = p;
-        overridden++;
+        resp = await bg({ type: "accounts.importOne", account: p, override: true });
+        if (resp && resp.status === "overridden") overridden++;
       } else {
         skipped++;
       }
-    } else {
-      accounts.push(p);
-      added++;
+      continue;
     }
+    if (resp.status === "added") added++;
   }
 
-  await saveAccounts(accounts);
   await renderAccounts();
 
   const parts = [];
   if (added) parts.push(`imported ${added}`);
   if (overridden) parts.push(`overrode ${overridden}`);
   if (skipped) parts.push(`skipped ${skipped} duplicate${skipped > 1 ? "s" : ""}`);
+  if (rejected) parts.push(`rejected ${rejected}${rejectReason ? ` (${rejectReason})` : ""}`);
   const summary = (parts.length ? parts.join(", ") : "nothing imported");
   const sentence = summary.charAt(0).toUpperCase() + summary.slice(1) + ".";
   $("importResult").textContent = sentence;
-  const warn = added === 0 && overridden === 0; // only duplicates were skipped
+  const warn = added === 0 && overridden === 0; // only duplicates/rejects
   toast(summary.charAt(0).toUpperCase() + summary.slice(1), warn ? "warn" : undefined);
 }
 
@@ -437,8 +648,10 @@ $("qrPageBtn").onclick = () =>
 
 // ---- export ---------------------------------------------------------------
 async function openExport() {
-  const accounts = await getAccounts();
-  $("exportText").value = accounts.map(toOtpauth).join("\n");
+  $("exportPass").value = "";
+  $("exportPass2").value = "";
+  $("exportText").value = "";
+  $("plainExportBox").classList.add("hidden");
   showView("exportView");
 }
 
@@ -452,30 +665,138 @@ function download(filename, content, type) {
   URL.revokeObjectURL(url);
 }
 
-async function downloadJson() {
-  const accounts = await getAccounts();
+async function downloadEncrypted() {
+  const p1 = $("exportPass").value;
+  const p2 = $("exportPass2").value;
+  if (p1.length < 8) {
+    toast("Use a passphrase of at least 8 characters", "warn");
+    return;
+  }
+  if (p1 !== p2) {
+    toast("Passphrases don't match", "warn");
+    return;
+  }
+  const resp = await bg({ type: "accounts.exportEncrypted", passphrase: p1 });
+  if (!resp) return;
+  if (resp.locked) {
+    showLock();
+    return;
+  }
   download(
-    "otp-accounts.json",
-    JSON.stringify({ version: 1, accounts }, null, 2),
+    "otp-backup.json",
+    JSON.stringify(resp.envelope, null, 2),
     "application/json"
   );
+  toast("Encrypted backup downloaded");
 }
 
-async function downloadUris() {
-  const accounts = await getAccounts();
-  download("otp-accounts.txt", accounts.map(toOtpauth).join("\n"), "text/plain");
+async function revealPlainExport() {
+  const ok = await confirmDialog(
+    "Plaintext export shows every 2FA seed unprotected. Anyone who reads the file or your clipboard gets your codes.\n\nShow it anyway?",
+    { okText: "Show plaintext", danger: true }
+  );
+  if (!ok) return;
+  const resp = await bg({ type: "accounts.export", format: "uri" });
+  if (!resp) return;
+  if (resp.locked) {
+    showLock();
+    return;
+  }
+  $("exportText").value = resp.text;
+  $("plainExportBox").classList.remove("hidden");
 }
 
 // ---- settings -------------------------------------------------------------
+
+async function renderVaultSection() {
+  const vs = await bg({ type: "vault.status" });
+  const state = vs ? vs.state : "plain";
+  $("vaultStateLine").textContent =
+    state === "plain"
+      ? "No master password — codes are stored unencrypted on this device."
+      : state === "unlocked"
+      ? "Accounts are encrypted with your master password (unlocked)."
+      : "Accounts are encrypted with your master password (locked).";
+  $("vaultPlainRow").classList.toggle("hidden", state !== "plain");
+  $("vaultOnBox").classList.toggle("hidden", state === "plain");
+}
+
+async function setMasterPassword() {
+  const p1 = await promptDialog(
+    "Choose a master password (at least 8 characters).\n\nYou'll type it once per browser session; codes stay encrypted on disk.",
+    { okText: "Next" }
+  );
+  if (p1 == null) return;
+  if (p1.length < 8) {
+    toast("Use at least 8 characters", "warn");
+    return;
+  }
+  const p2 = await promptDialog("Repeat the master password:", { okText: "Encrypt" });
+  if (p2 == null) return;
+  if (p1 !== p2) {
+    toast("Passwords don't match", "warn");
+    return;
+  }
+  const resp = await bg({ type: "vault.enable", password: p1 });
+  if (resp && resp.ok) {
+    await saveSettings({ vaultNudgeDismissed: true });
+    await renderVaultSection();
+    toast("Accounts encrypted ✓");
+  } else {
+    toast("Could not enable encryption", "warn");
+  }
+}
+
+async function changeMasterPassword() {
+  const current = await promptDialog("Current master password:", { okText: "Next" });
+  if (current == null) return;
+  const p1 = await promptDialog("New master password (at least 8 characters):", { okText: "Next" });
+  if (p1 == null) return;
+  if (p1.length < 8) {
+    toast("Use at least 8 characters", "warn");
+    return;
+  }
+  const p2 = await promptDialog("Repeat the new master password:", { okText: "Change" });
+  if (p2 == null) return;
+  if (p1 !== p2) {
+    toast("Passwords don't match", "warn");
+    return;
+  }
+  const resp = await bg({ type: "vault.changePassword", current, next: p1 });
+  if (resp && resp.ok) toast("Password changed ✓");
+  else toast(resp && resp.error === "wrong-password" ? "Wrong current password" : "Failed", "warn");
+}
+
+async function removeMasterPassword() {
+  const ok = await confirmDialog(
+    "Remove the master password? Your 2FA seeds will be stored unencrypted again.",
+    { okText: "Remove", danger: true }
+  );
+  if (!ok) return;
+  const password = await promptDialog("Master password:", { okText: "Decrypt & remove" });
+  if (password == null) return;
+  const resp = await bg({ type: "vault.disable", password });
+  if (resp && resp.ok) {
+    await renderVaultSection();
+    toast("Encryption removed");
+  } else {
+    toast(resp && resp.error === "wrong-password" ? "Wrong password" : "Failed", "warn");
+  }
+}
+
 async function openSettings() {
   const s = await getSettings();
   $("s_autoFill").checked = s.autoFill;
   $("s_autoSubmit").checked = s.autoSubmit;
   $("s_fallbackSingle").checked = s.fallbackSingle;
   $("s_matchByIssuer").checked = s.matchByIssuer;
+  $("s_issuerExactMatch").checked = s.issuerExactMatch;
   $("s_rememberDomainEmail").checked = s.rememberDomainEmail;
   $("s_showButton").checked = s.showButton;
   $("s_debug").checked = s.debug;
+  $("s_clearClipboard").checked = s.clearClipboard;
+  $("s_autoLockMinutes").value = String(s.autoLockMinutes || 0);
+  await renderVaultSection();
   await renderRemembered();
   showView("settingsView");
 }
@@ -486,9 +807,12 @@ async function persistSettings() {
     autoSubmit: $("s_autoSubmit").checked,
     fallbackSingle: $("s_fallbackSingle").checked,
     matchByIssuer: $("s_matchByIssuer").checked,
+    issuerExactMatch: $("s_issuerExactMatch").checked,
     rememberDomainEmail: $("s_rememberDomainEmail").checked,
     showButton: $("s_showButton").checked,
     debug: $("s_debug").checked,
+    clearClipboard: $("s_clearClipboard").checked,
+    autoLockMinutes: parseInt($("s_autoLockMinutes").value, 10) || 0,
   });
 }
 
@@ -539,12 +863,22 @@ $("doImportBtn").onclick = doImport;
 $("cancelImportBtn").onclick = () => showView("accountsView");
 
 $("exportFromSettingsBtn").onclick = openExport;
+$("downloadEncryptedBtn").onclick = downloadEncrypted;
+$("showPlainExportBtn").onclick = revealPlainExport;
 $("copyExportBtn").onclick = async () => {
-  await navigator.clipboard.writeText($("exportText").value);
+  const text = $("exportText").value;
+  await navigator.clipboard.writeText(text);
+  bg({ type: "clipboard.scheduleClear", text });
   toast("Copied");
 };
-$("downloadJsonBtn").onclick = downloadJson;
-$("downloadUriBtn").onclick = downloadUris;
+$("downloadJsonBtn").onclick = async () => {
+  const resp = await bg({ type: "accounts.export", format: "json" });
+  if (resp && resp.text) download("otp-accounts.json", resp.text, "application/json");
+};
+$("downloadUriBtn").onclick = async () => {
+  const resp = await bg({ type: "accounts.export", format: "uri" });
+  if (resp && resp.text) download("otp-accounts.txt", resp.text, "text/plain");
+};
 $("cancelExportBtn").onclick = () => showView("settingsView");
 
 $("settingsBtn").onclick = openSettings;
@@ -557,12 +891,22 @@ for (const id of [
   "s_autoSubmit",
   "s_fallbackSingle",
   "s_matchByIssuer",
+  "s_issuerExactMatch",
   "s_rememberDomainEmail",
   "s_showButton",
   "s_debug",
+  "s_clearClipboard",
+  "s_autoLockMinutes",
 ]) {
   $(id).addEventListener("change", persistSettings);
 }
+$("setPasswordBtn").onclick = setMasterPassword;
+$("changePasswordBtn").onclick = changeMasterPassword;
+$("removePasswordBtn").onclick = removeMasterPassword;
+$("lockNowBtn").onclick = async () => {
+  await bg({ type: "vault.lock" });
+  showLock();
+};
 $("clearRememberedBtn").onclick = async () => {
   if (!(await confirmDialog("Forget all remembered logins?", { okText: "Forget all", danger: true }))) return;
   await clearDomainEmails();
@@ -598,6 +942,11 @@ $("searchInput").addEventListener("input", (e) => {
 
 // ---- boot -----------------------------------------------------------------
 (async function init() {
-  await renderAccounts();
+  const vs = await bg({ type: "vault.status" });
+  if (vs && vs.state === "locked") {
+    showLock();
+  } else {
+    await renderAccounts();
+  }
   tickTimer = setInterval(tick, 1000);
 })();

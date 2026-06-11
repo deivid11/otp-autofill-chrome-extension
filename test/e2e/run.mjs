@@ -3,7 +3,7 @@
 // whether the boxes autofill. Dumps the content-script [OTP-AF] logs.
 import { chromium } from "playwright-core";
 import { createServer } from "node:http";
-import { readFileSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
 
@@ -87,6 +87,9 @@ function chromePath() {
 }
 
 const userDataDir = join(__dirname, ".profile");
+// always start clean: a reused profile keeps the previous run's service
+// worker cached, so code changes silently don't take effect
+rmSync(userDataDir, { recursive: true, force: true });
 const context = await chromium.launchPersistentContext(userDataDir, {
   headless: false,
   executablePath: chromePath(),
@@ -122,7 +125,9 @@ if (!sw) {
   await context.close(); server.close(); process.exit(2);
 }
 
-// seed account + settings + remembered domain email for 127.0.0.1
+// seed account + settings + remembered domain email for 127.0.0.1.
+// domains: the account is pre-bound to this host so it may autofill with no
+// gesture (the unbound flow is covered by test 4 below).
 await sw.evaluate(() => {
   return chrome.storage.local.set({
     accounts: [{
@@ -130,6 +135,7 @@ await sw.evaluate(() => {
       account: "jaime+1@osmos.mx",
       secret: "MFRGGZDFMZTWQ2LK",
       algorithm: "SHA1", digits: 6, period: 30, counter: 0,
+      domains: ["127.0.0.1"],
     }],
     settings: {
       autoFill: true, autoSubmit: false, fallbackSingle: true,
@@ -164,6 +170,52 @@ const hidden = await page.$eval(".hidden-input", (e) => e.value);
 const cells = await page.$$eval(".number", (els) => els.map((e) => e.textContent).join(""));
 console.log("TRANSFER hidden input:", hidden.length === 6 ? `FILLED -> ${hidden}` : `NOT FILLED ("${hidden}")`);
 console.log("TRANSFER visible cells:", cells.length === 6 ? `RENDERED -> ${cells}` : `NOT RENDERED ("${cells}")`);
+
+// test 4: domain binding — an account with NO bound domains must not autofill
+// silently; the floating button fills after a real click and binds the domain.
+await sw.evaluate(() => {
+  return chrome.storage.local.set({
+    accounts: [{
+      id: "test-2", type: "totp", issuer: "OPM SPEI",
+      account: "jaime+1@osmos.mx",
+      secret: "MFRGGZDFMZTWQ2LK",
+      algorithm: "SHA1", digits: 6, period: 30, counter: 0,
+      domains: [],
+    }],
+  });
+});
+await page.goto(URL, { waitUntil: "domcontentloaded" });
+await page.waitForTimeout(1500);
+values = await page.$$eval("#otpRow input", (els) => els.map((e) => e.value));
+const silent = values.join("");
+console.log("BINDING unbound stays empty:", silent === "" ? "PASS" : `FAIL (filled "${silent}")`);
+const btnLabel = await page
+  .$eval("#otp-autofill-helper", (el) => el.textContent)
+  .catch(() => null);
+console.log("BINDING helper button shown:", btnLabel && /fill otp/i.test(btnLabel) ? `PASS ("${btnLabel}")` : `FAIL ("${btnLabel}")`);
+await page.click("#otp-autofill-helper");
+await page.waitForTimeout(900);
+values = await page.$$eval("#otpRow input", (els) => els.map((e) => e.value));
+filled = values.join("");
+const boundDomains = await sw.evaluate(async () => {
+  const r = await chrome.storage.local.get("accounts");
+  return r.accounts[0].domains;
+});
+console.log("BINDING click fills:", filled.length === 6 ? `FILLED -> ${filled}` : `NOT FILLED ("${filled}")`);
+console.log("BINDING domain remembered:", boundDomains.includes("127.0.0.1") ? "PASS" : `FAIL (${JSON.stringify(boundDomains)})`);
+
+// test 5: issuer matching — strict (registrable domain) by default, loose
+// substring only when explicitly opted in via settings.issuerExactMatch=false
+const issuer = await sw.evaluate(() => ({
+  strictSub: issuerMatchesHost("GitHub", "login.github.com", true),
+  strictDomain: issuerMatchesHost("github.com", "github.com", true),
+  strictEvil: issuerMatchesHost("GitHub", "github.evil.com", true),
+  strictPrefix: issuerMatchesHost("GitHub", "login-github.attacker.io", true),
+  looseEvil: issuerMatchesHost("GitHub", "github.evil.com", false),
+}));
+console.log("ISSUER strict matches real domain:", issuer.strictSub && issuer.strictDomain ? "PASS" : `FAIL ${JSON.stringify(issuer)}`);
+console.log("ISSUER strict blocks lookalikes:", !issuer.strictEvil && !issuer.strictPrefix ? "PASS" : `FAIL ${JSON.stringify(issuer)}`);
+console.log("ISSUER loose opt-in is substring:", issuer.looseEvil ? "PASS" : `FAIL ${JSON.stringify(issuer)}`);
 
 await context.close();
 server.close();

@@ -6,18 +6,40 @@
 (function () {
   const B32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
-  // RFC 4648 base32 -> Uint8Array. Tolerates spaces, lowercase and padding.
-  function base32Decode(input) {
-    const clean = String(input || "")
+  // Uppercase, strip the spaces/hyphens services display for readability, and
+  // drop trailing padding. This is the only massaging a secret gets.
+  function normalizeBase32(input) {
+    return String(input || "")
       .toUpperCase()
-      .replace(/=+$/, "")
-      .replace(/[\s-]/g, "");
+      .replace(/[\s-]/g, "")
+      .replace(/=+$/, "");
+  }
+
+  // Strict check so typo'd secrets (0, 1, 8, 9 are not base32) are rejected
+  // when the account is added, instead of silently generating wrong codes.
+  function validateBase32(input) {
+    const clean = normalizeBase32(input);
+    if (!clean.length) return { ok: false, error: "Secret is empty" };
+    const bad = clean.match(/[^A-Z2-7]/);
+    if (bad) {
+      return {
+        ok: false,
+        error: `Secret has invalid base32 character “${bad[0]}” (only A–Z and 2–7 are valid)`,
+      };
+    }
+    return { ok: true, normalized: clean };
+  }
+
+  // RFC 4648 base32 -> Uint8Array. Tolerates spaces, lowercase and padding,
+  // but throws on anything else — see validateBase32.
+  function base32Decode(input) {
+    const v = validateBase32(input);
+    if (!v.ok) throw new Error(v.error);
     let bits = 0;
     let value = 0;
     const out = [];
-    for (const ch of clean) {
+    for (const ch of v.normalized) {
       const idx = B32_ALPHABET.indexOf(ch);
-      if (idx === -1) continue; // skip anything that is not valid base32
       value = (value << 5) | idx;
       bits += 5;
       if (bits >= 8) {
@@ -96,6 +118,8 @@
   }
 
   globalThis.OTP = Object.assign(globalThis.OTP || {}, {
+    normalizeBase32,
+    validateBase32,
     base32Decode,
     generateHOTP,
     generateTOTP,

@@ -1,7 +1,7 @@
 // E2E: duplicate import shows a warning + override prompt; Add-form QR fill;
 // Export lives in Settings; popup loads with no errors after button removal.
 import { chromium } from "playwright-core";
-import { readFileSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
 
@@ -19,6 +19,8 @@ function chromePath() {
   return undefined;
 }
 
+// start clean: a reused profile caches the previous service worker
+rmSync(join(__dirname, ".profile-imp"), { recursive: true, force: true });
 const context = await chromium.launchPersistentContext(join(__dirname, ".profile-imp"), {
   headless: false, executablePath: chromePath(),
   args: ["--headless=new", "--disable-gpu", "--no-sandbox",

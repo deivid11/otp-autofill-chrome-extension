@@ -1,7 +1,7 @@
 // E2E: verify the always-visible footer renders and that the footer's global
 // QR file input imports an account. Saves a screenshot for visual confirmation.
 import { chromium } from "playwright-core";
-import { readFileSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
 
@@ -19,6 +19,8 @@ function chromePath() {
   return undefined;
 }
 
+// start clean: a reused profile caches the previous service worker
+rmSync(join(__dirname, ".profile-foot"), { recursive: true, force: true });
 const context = await chromium.launchPersistentContext(join(__dirname, ".profile-foot"), {
   headless: false,
   executablePath: chromePath(),

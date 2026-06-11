@@ -2,7 +2,7 @@
 // background service worker (OffscreenCanvas), and that the background
 // add-from-QR flow persists the account.
 import { chromium } from "playwright-core";
-import { readFileSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve, join } from "node:path";
 
@@ -27,6 +27,8 @@ function chromePath() {
 const dataUrl =
   "data:image/png;base64," + readFileSync(QR_PNG).toString("base64");
 
+// start clean: a reused profile caches the previous service worker
+rmSync(join(__dirname, ".profile-qr"), { recursive: true, force: true });
 const context = await chromium.launchPersistentContext(join(__dirname, ".profile-qr"), {
   headless: false,
   executablePath: chromePath(),

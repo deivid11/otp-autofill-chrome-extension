@@ -1,6 +1,10 @@
 // src/storage.js
 // Thin async wrapper over chrome.storage for accounts, settings and the
 // short-lived captured email. Shared via globalThis.OTP.
+// Loaded by the background worker and the popup ONLY — content scripts get
+// everything they need via messages, so no seed-handling code runs in pages.
+// getAccounts/saveAccounts are the raw plaintext layer; everything except
+// vault.js must go through getAccountsSecure/saveAccountsSecure instead.
 
 (function () {
   const ACCOUNTS_KEY = "accounts";
@@ -11,9 +15,13 @@
     autoSubmit: false, // click the submit button after filling
     fallbackSingle: true, // if exactly one account exists, use it when no email match
     matchByIssuer: true, // also try to match the page hostname against the issuer
+    issuerExactMatch: true, // issuer must equal the registrable domain; off = legacy substring match
     showButton: true, // show the floating "Fill OTP" helper button
     rememberDomainEmail: true, // durably remember the last login email per domain
     debug: false, // verbose [OTP-AF] console logging for troubleshooting
+    autoLockMinutes: 0, // master-password auto-lock; 0 = until the browser closes
+    clearClipboard: true, // wipe copied codes from the clipboard after ~45 s
+    vaultNudgeDismissed: false, // "set a master password" banner was dismissed
   };
 
   const DOMAIN_EMAIL_PREFIX = "domainEmail:";

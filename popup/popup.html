@@ -19,7 +19,26 @@
     </header>
 
     <main>
+      <!-- Vault lock screen -->
+      <section id="lockView" class="hidden">
+        <div class="lockbox">
+          <div class="locklogo">🔒</div>
+          <h2>Unlocked once per browser session</h2>
+          <p class="muted">Enter your master password to decrypt your accounts.</p>
+          <input id="unlockPassword" type="password" placeholder="Master password" autocomplete="current-password" />
+          <p id="unlockError" class="error hidden">Wrong password</p>
+          <button id="unlockBtn" class="primary">Unlock</button>
+        </div>
+      </section>
+
       <section id="accountsView">
+        <div id="vaultNudge" class="nudge hidden">
+          <span>Your codes are stored <b>unencrypted</b>. Set a master password to protect them.</span>
+          <div class="nudge-actions">
+            <button id="nudgeSetBtn" class="primary">Set password</button>
+            <button id="nudgeDismissBtn" class="ghost" title="Dismiss">✕</button>
+          </div>
+        </div>
         <div class="searchbar">
           <input id="searchInput" type="search" placeholder="Search accounts…" autocomplete="off" />
         </div>
@@ -45,6 +64,10 @@
           <label class="fld"><span>Account / email</span><input id="f_account" type="text" placeholder="user@mail.com" /></label>
         </div>
         <label class="fld"><span>Secret (base32)</span><input id="f_secret" type="text" placeholder="JBSWY3DPEHPK3PXP" /></label>
+        <div id="domainsBox" class="hidden">
+          <span class="fld-label">Sites allowed to autofill this account</span>
+          <div id="domainsList"></div>
+        </div>
         <div class="grid3">
           <label class="fld"><span>Algorithm</span>
             <select id="f_algorithm">
@@ -82,22 +105,57 @@ otpauth://totp/OpmSpei:user%40mail.com?secret=...&issuer=OpmSpei"></textarea>
       <!-- Export -->
       <section id="exportView" class="hidden">
         <h2>Export accounts</h2>
-        <textarea id="exportText" rows="8" readonly></textarea>
+        <p class="muted">Backups are encrypted with a passphrase (PBKDF2 + AES-256-GCM). Keep the passphrase safe — without it the backup can't be restored.</p>
+        <label class="fld"><span>Backup passphrase</span><input id="exportPass" type="password" autocomplete="new-password" /></label>
+        <label class="fld"><span>Repeat passphrase</span><input id="exportPass2" type="password" autocomplete="new-password" /></label>
         <div class="row">
-          <button id="copyExportBtn" class="primary">Copy</button>
-          <button id="downloadJsonBtn" class="ghost">Download JSON</button>
-          <button id="downloadUriBtn" class="ghost">Download .txt (URIs)</button>
+          <button id="downloadEncryptedBtn" class="primary">⤓ Download encrypted backup</button>
+        </div>
+        <div class="row">
+          <button id="showPlainExportBtn" class="ghost">Show plaintext export…</button>
           <button id="cancelExportBtn" class="ghost">Close</button>
+        </div>
+        <div id="plainExportBox" class="hidden">
+          <p class="muted warn-text">⚠ Plaintext export — anyone who sees this text gets your 2FA seeds.</p>
+          <textarea id="exportText" rows="8" readonly></textarea>
+          <div class="row">
+            <button id="copyExportBtn" class="ghost">Copy</button>
+            <button id="downloadJsonBtn" class="ghost">Download JSON</button>
+            <button id="downloadUriBtn" class="ghost">Download .txt (URIs)</button>
+          </div>
         </div>
       </section>
 
       <!-- Settings -->
       <section id="settingsView" class="hidden">
-        <h2>Settings</h2>
+        <h2>Security</h2>
+        <p id="vaultStateLine" class="muted"></p>
+        <div class="row" id="vaultPlainRow">
+          <button id="setPasswordBtn" class="primary">Set master password…</button>
+        </div>
+        <div id="vaultOnBox" class="hidden">
+          <div class="row">
+            <button id="changePasswordBtn" class="ghost">Change password…</button>
+            <button id="lockNowBtn" class="ghost">Lock now</button>
+            <button id="removePasswordBtn" class="ghost">Remove…</button>
+          </div>
+          <label class="fld" style="margin-top:10px;"><span>Auto-lock after inactivity</span>
+            <select id="s_autoLockMinutes">
+              <option value="0">When the browser closes</option>
+              <option value="5">5 minutes</option>
+              <option value="15">15 minutes</option>
+              <option value="60">1 hour</option>
+            </select>
+          </label>
+        </div>
+        <label class="chk"><input type="checkbox" id="s_clearClipboard" /> Clear copied codes from clipboard after 45 s</label>
+
+        <h2 style="margin-top:18px;">Settings</h2>
         <label class="chk"><input type="checkbox" id="s_autoFill" /> Autofill OTP automatically</label>
         <label class="chk"><input type="checkbox" id="s_autoSubmit" /> Auto-submit after filling</label>
         <label class="chk"><input type="checkbox" id="s_fallbackSingle" /> Use the only account when no email match</label>
         <label class="chk"><input type="checkbox" id="s_matchByIssuer" /> Match page by issuer name</label>
+        <label class="chk chk-sub"><input type="checkbox" id="s_issuerExactMatch" /> Strict issuer match (exact site domain)</label>
         <label class="chk"><input type="checkbox" id="s_rememberDomainEmail" /> Remember last login email per domain</label>
         <label class="chk"><input type="checkbox" id="s_showButton" /> Show floating "Fill OTP" button</label>
         <label class="chk"><input type="checkbox" id="s_debug" /> Debug logging (DevTools console)</label>
@@ -132,10 +190,11 @@ otpauth://totp/OpmSpei:user%40mail.com?secret=...&issuer=OpmSpei"></textarea>
     <!-- Global QR file input, reachable from anywhere via the footer -->
     <input id="qrFileGlobal" type="file" accept="image/*" hidden />
 
-    <!-- In-frame confirm dialog (replaces native confirm/alert) -->
+    <!-- In-frame confirm/prompt dialog (replaces native confirm/alert) -->
     <div id="modal" class="modal-overlay hidden">
       <div class="modal-box" role="dialog" aria-modal="true">
         <p id="modalMsg" class="modal-msg"></p>
+        <input id="modalInput" type="password" class="hidden" autocomplete="off" />
         <div class="modal-actions">
           <button id="modalCancel" class="ghost">Cancel</button>
           <button id="modalOk" class="primary">OK</button>
@@ -145,7 +204,7 @@ otpauth://totp/OpmSpei:user%40mail.com?secret=...&issuer=OpmSpei"></textarea>
 
     <div id="toast" class="toast hidden"></div>
 
-    <script src="../src/totp.js"></script>
+    <!-- No totp.js here: codes and secrets stay in the background worker -->
     <script src="../src/otpauth.js"></script>
     <script src="../src/storage.js"></script>
     <script src="../vendor/jsQR.js"></script>

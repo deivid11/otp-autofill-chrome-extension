@@ -61,8 +61,10 @@
 
   // Fetch an image by URL (used by the right-click context menu in the
   // background worker; extension host permissions bypass page CORS).
+  // credentials:"omit" so the extension never attaches the user's cookies to
+  // an arbitrary image URL.
   async function decodeFromUrl(url) {
-    const blob = await (await fetch(url)).blob();
+    const blob = await (await fetch(url, { credentials: "omit" })).blob();
     return decodeFromBlob(blob);
   }
 

@@ -116,6 +116,10 @@
       digits: parseInt(a.digits, 10) || 6,
       period: parseInt(a.period, 10) || 30,
       counter: parseInt(a.counter, 10) || 0,
+      // per-site autofill approvals — kept so JSON backups restore them
+      domains: Array.isArray(a.domains)
+        ? a.domains.filter((d) => typeof d === "string")
+        : [],
     };
   }
 
